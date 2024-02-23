@@ -1,0 +1,275 @@
+---
+title: "Phylogenetic smoothing"
+author: "Nicholas Clark"
+date: "2024-02-24"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{css, echo=FALSE}
+details > summary {
+  padding: 4px;
+  background-color: #8F2727;
+  color: white;
+  border: none;
+  box-shadow: 1px 1px 2px #bbbbbb;
+  cursor: pointer;
+}
+
+details > summary:hover {
+  background-color: #DCBCBC;
+  color: #8F2727;
+}
+
+.scroll-300 {
+  max-height: 300px;
+  overflow-y: auto;
+  background-color: inherit;
+}
+
+h1, #TOC>ul>li {
+  color: #8F2727;
+}
+
+h2, #TOC>ul>ul>li {
+  color: #8F2727;
+}
+
+h3, #TOC>ul>ul>li {
+  color: #8F2727;
+}
+
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    z-index: 2;
+    color: #fff;
+    background-color: #DCBCBC;
+    border-color: #DCBCBC;
+}
+
+a {
+    color: purple;
+    font-weight: bold;
+}
+
+a:hover {
+    color: #C79999;
+}
+
+::selection {
+  background: #DCBCBC;
+  color: #8F2727;
+}
+
+.button_red {
+  background-color: #8F2727;
+  border: #8F2727;
+  color: white;
+}
+
+.button_red:hover {
+  background-color: #DCBCBC;
+  color: #8F2727;
+}
+```
+
+```{r klippy, echo=FALSE, include=TRUE, message = FALSE, warning = FALSE}
+if(!requireNamespace('klippy')){
+  remotes::install_github("rlesur/klippy")
+}
+klippy::klippy(position = c('top', 'right'), color = 'darkred')
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,   
+  dpi = 150,
+  fig.asp = 0.8,
+  fig.width = 6,
+  out.width = "60%",
+  fig.align = "center",
+  class.source='klippy')
+```
+
+## Environment setup
+Load libraries
+```{r, include=FALSE}
+library(ape)
+library(mgcv)
+library(mvnfast)
+library(ggplot2)
+library(dplyr)
+library(MRFtools)
+```
+
+```{r, eval=FALSE}
+library(ape)
+library(mgcv)
+library(mvnfast)
+library(ggplot2)
+library(dplyr)
+library(MRFtools) # devtools::install_github("eric-pedersen/MRFtools")
+```
+
+A utility function to simulate from a squared exponential Gaussian Process
+```{r}
+sim_gp = function(N, alpha, rho){
+  Sigma <- alpha ^ 2 *
+    exp(-0.5 * ((outer(1:N, 1:N, "-") / rho) ^ 2)) +
+    diag(1e-9, N)
+  mvnfast::rmvn(1,
+                mu = rep(0, N),
+                sigma = Sigma)[1,]
+}
+```
+
+## Phylogenetically structured trends
+
+Simulate a random phylogenetic tree
+```{r}
+N_species <- 12
+tree <- rcoal(N_species, tip.label = paste0('sp_', 1:N_species))
+species_names <- tree$tip.label
+plot(tree)
+```
+
+Simulate a 'shared' nonlinear temporal trend
+```{r}
+N <- 50
+shared <- sim_gp(N, alpha = 1, rho = 8) + 10
+plot(shared, type = 'l', lwd = 2, xlab = 'Time', ylab = 'Trend')
+```
+
+Each species' actual trend is a perturbation of this shared trend, whereby the trend is a weighted sum of the shared trend and two other GP trends, with more closely related species having more similar weights
+```{r}
+warp1 <- sim_gp(N, alpha = 2, rho = 20) + 10
+warp2 <- sim_gp(N, alpha = 2, rho = 20) + 10
+weights1 <- as.vector(scale(rTraitCont(tree)))
+weights2 <- as.vector(scale(rTraitCont(tree)))
+```
+
+Create the trends for each species and take noisy observations. For the third and seventh species, set observations to `NA` so we can test if the model is able to recover their trends. Store all necessary data in a `data.frame`
+```{r}
+dat <- do.call(rbind, 
+               lapply(seq_len(N_species),
+                      function(i){
+                        sp_trend <- warp1 * weights1[i] + 
+                          warp2 * weights2[i] + shared
+                        obs <- rnorm(N, 
+                                     mean = as.vector(scale(sp_trend)),
+                                     sd = 0.35)
+                        if(i %in% c(3, 7)){
+                          weight <- 0
+                          obs <- NA
+                        } else {
+                          weight <- 1
+                        }
+                        data.frame(species = species_names[i],
+                                   weight = weight,
+                                   time = 1:N,
+                                   truth = as.vector(scale(sp_trend)),
+                                   y = obs)
+                      }))
+dat$species <- factor(dat$species, levels = species_names)
+```
+
+Leave out the last 5 observations for each species so we can see how well (or how poorly) the trends extrapolate
+```{r}
+dat %>%
+  dplyr::mutate(y = dplyr::case_when(
+    time <= N-5 ~ y,
+    time > N-5 ~ NA,
+    TRUE ~ y
+  )) -> dat
+```
+
+## Data visualisation
+Plot the true simulated trends for each species
+```{r}
+ggplot(dat, aes(x = time, y = truth, col = species)) +
+  geom_line() +
+  facet_wrap(~species, scales = 'free_y') + 
+  theme_classic() +
+  theme(legend.position = 'none')
+```
+
+Plot the noisy observations (noting that all obs are missing for two species)
+```{r}
+ggplot(dat, aes(x = time, y = y*weight, col = species)) +
+  geom_point() +
+  facet_wrap(~species, scales = 'free_y') + 
+  theme_classic() +
+  theme(legend.position = 'none')
+```
+
+## Model setup
+Create the MRF penalty matrix using the phylogenetic precision matrix
+```{r}
+omega <- solve(vcv(tree))
+```
+
+Now add an MRF penalty that forces the temporal trend to evolve as a Random Walk using utilities provided by Pedersen et al's `MRFtools` package. This requires that we have a factor variable for `time` in our data, and we should ensure the levels of this `time_factor` go as high as we would potentially like to forecast. Note that this package can also create the phylogenetic penalty but I feel it is better to show these steps explicitly for this example.
+```{r}
+rw_penalty <- mrf_penalty(object = 1:max(dat$time), 
+                          type = 'linear')
+dat$time_factor <- factor(1:max(dat$time))
+```
+
+Fit a GAM using a tensor product of the RW MRF basis and the phylogenetic MRF basis. Set `drop.unused.levels = FALSE` to ensure there are no errors because of the extra species and times in the penalty matrices
+```{r}
+mod <- gam(y ~ te(time_factor, species, 
+                  bs = c("mrf", "mrf"),
+                  k = c(8, N_species),
+                  xt = list(list(penalty = rw_penalty), 
+                            list(penalty = omega))),
+           data = dat,
+           drop.unused.levels = FALSE,
+           method = "REML")
+summary(mod)
+```
+
+## Predictions and evaluation
+Calculate point predictions from the model for the full dataset (including the missing species) and overlay the actual true simulated trends as black points. Did the model successfully estimate the missing species' temporal trend?
+```{r}
+preds <- predict(mod, newdata = dat, type = 'response', se = TRUE)
+dat$pred <- preds$fit
+dat$upper <- preds$fit + 1.96*preds$se.fit
+dat$lower <- preds$fit - 1.96*preds$se.fit
+ggplot(dat, aes(x = time, y = pred, col = species)) +
+  geom_point(aes(y = truth), col = 'black') +
+  geom_line(linewidth = 1, alpha = 0.6) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = species),
+              alpha = 0.3, col = NA) +
+  facet_wrap(~species, scales = 'free_y') + 
+  theme_classic() +
+  theme(legend.position = 'none')
+```
+
+Hot Damn it worked! But could we recover these missing trends without the information provided in the phylogenetic structure? Fit a second GAM that uses a hierarchical smooth of time
+```{r}
+mod2 <- gam(y ~ s(time, k = 10) +
+              s(time, species, bs = 'fs', k = 8),
+           data = dat,
+           method = "REML",
+           drop.unused.levels = FALSE)
+summary(mod2)
+```
+
+Now predict from the non-phylogenetic model
+```{r}
+preds <- predict(mod2, newdata = dat, type = 'response', se = TRUE)
+dat$pred <- preds$fit
+dat$upper <- preds$fit + 1.96*preds$se.fit
+dat$lower <- preds$fit - 1.96*preds$se.fit
+ggplot(dat, aes(x = time, y = pred, col = species)) +
+  geom_point(aes(y = truth), col = 'black') +
+  geom_line(linewidth = 1, alpha = 0.6) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = species),
+              alpha = 0.3, col = NA) +
+  facet_wrap(~species, scales = 'free_y') + 
+  theme_classic() +
+  theme(legend.position = 'none')
+```
+
+Predictions from this model draw more from the 'average' smooth, rather than leveraging phylogenetic information, to predict the trends for the missing species. So the predictions for both missing species are identical. Obviously we can tell by eye that the predictions are worse than those from the phylogenetic model. But we could use Continuous Rank Probability Scores for each model's predictions to quantify *how much* worse
