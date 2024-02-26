@@ -216,9 +216,10 @@ rw_penalty <- mrf_penalty(object = 1:max(dat$time),
 dat$time_factor <- factor(1:max(dat$time))
 ```
 
-Fit a GAM using a tensor product of the RW MRF basis and the phylogenetic MRF basis. Set `drop.unused.levels = FALSE` to ensure there are no errors because of the extra species and times in the penalty matrices
+Fit a GAM using a tensor product of the RW MRF basis and the phylogenetic MRF basis. We also use a 'shared' smooth of time so that the phylogenetic smooths are estimated as deviations around this shared smooth. Set `drop.unused.levels = FALSE` to ensure there are no errors because of the extra species and times in the penalty matrices
 ```{r}
-mod <- gam(y ~ te(time_factor, species, 
+mod <- gam(y ~ s(time, k = 10) + 
+               te(time_factor, species, 
                   bs = c("mrf", "mrf"),
                   k = c(8, N_species),
                   xt = list(list(penalty = rw_penalty), 
@@ -246,7 +247,7 @@ ggplot(dat, aes(x = time, y = pred, col = species)) +
   theme(legend.position = 'none')
 ```
 
-Hot Damn it worked! But could we recover these missing trends without the information provided in the phylogenetic structure? Fit a second GAM that uses a hierarchical smooth of time
+Hot Damn it worked! But could we recover these missing trends without the information provided in the phylogenetic structure? Fit a second GAM that uses a similar hierarchical smooth of time, but in this case the deviations around the shared smooth do not have any phylogenetic information to leverage
 ```{r}
 mod2 <- gam(y ~ s(time, k = 10) +
               s(time, species, bs = 'fs', k = 8),
@@ -272,4 +273,4 @@ ggplot(dat, aes(x = time, y = pred, col = species)) +
   theme(legend.position = 'none')
 ```
 
-Predictions from this model draw more from the 'average' smooth, rather than leveraging phylogenetic information, to predict the trends for the missing species. So the predictions for both missing species are identical. Obviously we can tell by eye that the predictions are worse than those from the phylogenetic model. But we could use Continuous Rank Probability Scores for each model's predictions to quantify *how much* worse
+Predictions from this model draw from the 'average' smooth, rather than leveraging phylogenetic information, to predict the trends for the missing species. So the predictions for both missing species are identical. Obviously we can tell by eye that the predictions are worse than those from the phylogenetic model. But we could use Continuous Rank Probability Scores for each model's predictions to quantify *how much* worse
